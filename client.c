@@ -86,8 +86,11 @@ static void init_csi_detach(void) {
 }
 
 /* Parse a CSI u sequence: ESC [ <number> ; <number> [: <number>] u
- * Returns true if it encodes the detach key with ctrl modifier.
- * Accepts any additional modifiers (numlock, capslock, etc.). */
+ * Returns true if it encodes the detach key with only the ctrl modifier
+ * (plus any lock keys like numlock/capslock).
+ *
+ * Does NOT match if shift, alt, or super are also held, mirroring the
+ * legacy behavior where only the exact control byte triggers detach. */
 static bool is_csi_detach(const char *buf, ssize_t len) {
 	if (len < 6 || buf[0] != '\033' || buf[1] != '[')
 		return false;
@@ -112,21 +115,33 @@ static bool is_csi_detach(const char *buf, ssize_t len) {
 	while (i < len && buf[i] >= '0' && buf[i] <= '9')
 		mod = mod * 10 + (buf[i++] - '0');
 
-	/* Skip optional event type (:1=press, :2=repeat, :3=release) */
+	/* Check optional event type — only match press (:1) or
+	 * absent (implied press), not repeat (:2) or release (:3). */
 	if (i < len && buf[i] == ':') {
 		i++;
+		unsigned int event = 0;
 		while (i < len && buf[i] >= '0' && buf[i] <= '9')
-			i++;
+			event = event * 10 + (buf[i++] - '0');
+		if (event != 1)
+			return false;
 	}
 
 	/* Must end with 'u' */
 	if (i != len - 1)
 		return false;
 
-	/* Check ctrl is set: modifier = 1 + bitmask, ctrl = bit 2 (value 4) */
+	/* Modifier = 1 + bitmask.  Check ctrl (bit 2) is set and no
+	 * other non-lock modifiers (shift=1, alt=2, super=8, hyper=16,
+	 * meta=32) are present.  Lock keys (capslock=64, numlock=128)
+	 * are allowed since they don't affect the key identity. */
 	if (mod < 1)
 		return false;
-	return ((mod - 1) & 4) != 0;
+	unsigned int bits = mod - 1;
+	if (!(bits & 4))
+		return false;  /* ctrl not set */
+	if (bits & (1|2|8|16|32))
+		return false;  /* shift, alt, super, hyper, or meta also held */
+	return true;
 }
 
 static int client_mainloop(void) {
