@@ -55,12 +55,88 @@ static void client_setup_terminal(void) {
 	}
 }
 
+
+/* Kitty keyboard protocol support.
+ *
+ * Modern terminals (kitty, wezterm, foot, ghostty) and applications (fish,
+ * neovim, helix) increasingly use the kitty keyboard protocol, which encodes
+ * key presses as CSI sequences instead of raw control bytes:
+ *
+ *   Ctrl-\  ->  legacy: 0x1C  ->  kitty protocol: ESC [ 92 ; <mod> u
+ *
+ * The modifier value encodes all active modifiers plus lock keys:
+ *   modifier = 1 + (shift:1|alt:2|ctrl:4|super:8|...|capslock:64|numlock:128)
+ * So Ctrl-\ with numlock on = ESC [ 92 ; 133 u.
+ *
+ * abduco's detach key detection only checks for the single-byte value, so
+ * detaching fails whenever the keyboard protocol is active.  This adds a
+ * parser that recognizes the CSI u encoding with ctrl set in the modifier.
+ */
+
+static unsigned int csi_detach_codepoint;
+
+static void init_csi_detach(void) {
+	/* Recover the base character from the control byte.
+	 * CTRL(k) = k & 0x1F, so base = KEY_DETACH | 0x40 for @[\]^_
+	 * and base = KEY_DETACH | 0x60 for letters (a-z). */
+	if (KEY_DETACH >= 1 && KEY_DETACH <= 26)
+		csi_detach_codepoint = KEY_DETACH + 0x60;
+	else
+		csi_detach_codepoint = KEY_DETACH + 0x40;
+}
+
+/* Parse a CSI u sequence: ESC [ <number> ; <number> [: <number>] u
+ * Returns true if it encodes the detach key with ctrl modifier.
+ * Accepts any additional modifiers (numlock, capslock, etc.). */
+static bool is_csi_detach(const char *buf, ssize_t len) {
+	if (len < 6 || buf[0] != '\033' || buf[1] != '[')
+		return false;
+	if (buf[len - 1] != 'u')
+		return false;
+
+	/* Parse codepoint */
+	unsigned int codepoint = 0;
+	int i = 2;
+	while (i < len && buf[i] >= '0' && buf[i] <= '9')
+		codepoint = codepoint * 10 + (buf[i++] - '0');
+	if (codepoint != csi_detach_codepoint)
+		return false;
+
+	/* Expect semicolon */
+	if (i >= len || buf[i] != ';')
+		return false;
+	i++;
+
+	/* Parse modifier value */
+	unsigned int mod = 0;
+	while (i < len && buf[i] >= '0' && buf[i] <= '9')
+		mod = mod * 10 + (buf[i++] - '0');
+
+	/* Skip optional event type (:1=press, :2=repeat, :3=release) */
+	if (i < len && buf[i] == ':') {
+		i++;
+		while (i < len && buf[i] >= '0' && buf[i] <= '9')
+			i++;
+	}
+
+	/* Must end with 'u' */
+	if (i != len - 1)
+		return false;
+
+	/* Check ctrl is set: modifier = 1 + bitmask, ctrl = bit 2 (value 4) */
+	if (mod < 1)
+		return false;
+	return ((mod - 1) & 4) != 0;
+}
+
 static int client_mainloop(void) {
 	sigset_t emptyset, blockset;
 	sigemptyset(&emptyset);
 	sigemptyset(&blockset);
 	sigaddset(&blockset, SIGWINCH);
 	sigprocmask(SIG_BLOCK, &blockset, NULL);
+
+	init_csi_detach();
 
 	client.need_resize = true;
 	Packet pkt = {
@@ -124,7 +200,7 @@ static int client_mainloop(void) {
 				pkt.len = len;
 				if (KEY_REDRAW && pkt.u.msg[0] == KEY_REDRAW) {
 					client.need_resize = true;
-				} else if (pkt.u.msg[0] == KEY_DETACH) {
+				} else if (pkt.u.msg[0] == KEY_DETACH || is_csi_detach(pkt.u.msg, len)) {
 					pkt.type = MSG_DETACH;
 					pkt.len = 0;
 					client_send_packet(&pkt);
